@@ -9,10 +9,10 @@ Features
 	•	Outputs image and mask tensors
 
 Installation
-'''
+```
 cd ComfyUI/custom_nodes
 git clone https://github.com/Atsushi888/ComfyUI-MediaPreview.git
-'''
+```
 Restart ComfyUI.
 
 Quick Demo
