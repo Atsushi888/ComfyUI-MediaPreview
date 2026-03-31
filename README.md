@@ -1,4 +1,3 @@
-:::writing{variant=“standard” id=“73829”}
 Installation
 # ComfyUI-MediaPreview
 All-in-one preview node for ComfyUI.
@@ -24,4 +23,3 @@ Connect any of:
 	•	media_path
 
 Preview updates automatically.
-:::
