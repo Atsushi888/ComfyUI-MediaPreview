@@ -40,6 +40,11 @@ function isMedia(name) {
   return MEDIA_EXTS.some((e) => s.endsWith(e));
 }
 
+function isUrl(value) {
+  const s = (value || "").toString().trim().toLowerCase();
+  return s.startsWith("http://") || s.startsWith("https://");
+}
+
 function normalizePath(p) {
   return (p || "").toString().trim().replace(/\\/g, "/");
 }
@@ -53,43 +58,6 @@ function buildFullPath(baseDir, media) {
   const name = (media || "").toString().trim().replace(/^[\/\\]+/, "");
   if (!base || !name) return "";
   return `${base}/${name}`.replace(/\\/g, "/");
-}
-
-function splitSubfolder(path) {
-  const p = normalizePath(path);
-  const idx = p.lastIndexOf("/");
-  if (idx === -1) return { subfolder: "", filename: p };
-  return { subfolder: p.slice(0, idx), filename: p.slice(idx + 1) };
-}
-
-function resolveTypeAndRelByPath(fullPath) {
-  const s = normalizePath(fullPath);
-  if (!s) return { type: "input", rel: "" };
-
-  const inRoot = "/workspace/ComfyUI/input/";
-  const outRoot = "/workspace/ComfyUI/output/";
-  const tmpRoot = "/workspace/ComfyUI/temp/";
-
-  if (s.startsWith(inRoot)) return { type: "input", rel: s.slice(inRoot.length) };
-  if (s.startsWith(outRoot)) return { type: "output", rel: s.slice(outRoot.length) };
-  if (s.startsWith(tmpRoot)) return { type: "temp", rel: s.slice(tmpRoot.length) };
-
-  return { type: "input", rel: "" };
-}
-
-function buildViewURL(fullPath) {
-  const { type, rel } = resolveTypeAndRelByPath(fullPath);
-  const { subfolder, filename } = splitSubfolder(rel);
-
-  const q = new URLSearchParams();
-  q.set("filename", filename || "");
-  q.set("type", type);
-  q.set("subfolder", subfolder || "");
-  q.set("_ts", String(Date.now()));
-  q.set("_seq", String(MP_RENDER_SEQ++));
-  q.set("_rand", Math.random().toString(36).slice(2));
-
-  return api.apiURL(`/view?${q.toString()}`);
 }
 
 function isInputConnected(node, inputName) {
@@ -231,6 +199,25 @@ async function fetchMediaList(baseDir) {
   return items.filter((x) => typeof x === "string" && isMedia(x));
 }
 
+function buildProxyURL(uniqueId, nodeId) {
+  const q = new URLSearchParams();
+  if (uniqueId) q.set("unique_id", String(uniqueId));
+  if (nodeId) q.set("node_id", String(nodeId));
+  q.set("_ts", String(Date.now()));
+  q.set("_seq", String(MP_RENDER_SEQ++));
+  q.set("_rand", Math.random().toString(36).slice(2));
+  return api.apiURL(`/media_preview/file?${q.toString()}`);
+}
+
+function buildDirectPathProxyURL(fullPath) {
+  const q = new URLSearchParams();
+  q.set("path", normalizePath(fullPath));
+  q.set("_ts", String(Date.now()));
+  q.set("_seq", String(MP_RENDER_SEQ++));
+  q.set("_rand", Math.random().toString(36).slice(2));
+  return api.apiURL(`/media_preview/file?${q.toString()}`);
+}
+
 async function refreshMediaChoices(node) {
   const baseW = getWidget(node, "base_dir");
   const mediaW = getWidget(node, "media");
@@ -308,11 +295,6 @@ async function resolvePreviewPath(node, msg, lastUniqueIdRef) {
     if (resolvedPath) return resolvedPath;
 
     resolvedPath = await fetchPreviewPath(uid || lastUniqueIdRef.value, node.id);
-    logDbg("[MediaPreview][poll]", {
-      node_id: node.id,
-      unique_id: lastUniqueIdRef.value || "",
-    });
-
     logDbg("[MediaPreview][resolvePreviewPath:from_ping]", {
       node_id: node.id,
       unique_id: uid || lastUniqueIdRef.value,
@@ -408,14 +390,13 @@ app.registerExtension({
           isInputConnected(this, "image") ||
           isInputConnected(this, "mask")
         );
-      };      
+      };
 
       let previewWidget = null;
 
-      // ===== polling制御 =====
       let pollTimer = null;
       let lastPolledPath = "";
-    
+
       const stopPolling = () => {
         if (pollTimer) {
           clearInterval(pollTimer);
@@ -423,25 +404,25 @@ app.registerExtension({
         }
         lastPolledPath = "";
       };
-    
+
       const startPolling = () => {
         if (pollTimer) return;
-    
+
         pollTimer = setInterval(async () => {
           try {
             if (!hasPollingSource()) {
               stopPolling();
               return;
             }
-    
+
             const path = await fetchPreviewPath(lastUniqueIdRef.value || this.id, this.id);
             const p = normalizePath(path);
-    
+
             if (!p) {
               lastPolledPath = "";
               setMediaPathDisplay("");
               clear();
-    
+
               if (isInputConnected(this, "image")) {
                 setStatus("Waiting image...");
               } else if (isInputConnected(this, "mask")) {
@@ -449,19 +430,18 @@ app.registerExtension({
               } else {
                 setStatus("Waiting input...");
               }
-    
+
               this.setDirtyCanvas?.(true, true);
               return;
             }
-    
+
             if (p === lastPolledPath) return;
-    
+
             lastPolledPath = p;
-    
             setMediaPathDisplay(p);
             render(p);
             this.setDirtyCanvas?.(true, true);
-    
+
           } catch (e) {
             console.warn("[MediaPreview] polling error:", e);
           }
@@ -560,6 +540,7 @@ app.registerExtension({
         logDbg("[MediaPreview][render]", {
           node_id: this.id,
           fullPath: p,
+          unique_id: lastUniqueIdRef.value || "",
         });
 
         if (!p) {
@@ -575,7 +556,17 @@ app.registerExtension({
         }
 
         const token = ++renderToken;
-        const url = buildViewURL(p);
+
+        // 表示経路は proxy に統一する
+        const url = isUrl(p)
+          ? buildProxyURL(lastUniqueIdRef.value || this.id, this.id)
+          : buildDirectPathProxyURL(p);
+
+        logDbg("[MediaPreview][render:url]", {
+          node_id: this.id,
+          source_path: p,
+          render_url: url,
+        });
 
         wrap.innerHTML = "";
 
@@ -612,6 +603,12 @@ app.registerExtension({
             if (token !== renderToken) return;
             currentEl = null;
             wrap.innerHTML = "";
+            logDbg("[MediaPreview][video:error]", {
+              node_id: this.id,
+              attempted_url: url,
+              source_path: p,
+              unique_id: lastUniqueIdRef.value || "",
+            });
             setStatus("VIDEO LOAD ERROR");
           });
 
@@ -637,6 +634,12 @@ app.registerExtension({
           if (token !== renderToken) return;
           currentEl = null;
           wrap.innerHTML = "";
+          logDbg("[MediaPreview][img:error]", {
+            node_id: this.id,
+            attempted_url: url,
+            source_path: p,
+            unique_id: lastUniqueIdRef.value || "",
+          });
           setStatus("IMAGE LOAD ERROR");
         });
       };
@@ -666,7 +669,6 @@ app.registerExtension({
       };
 
       const decideAndRender = async (msg = null) => {
-        // polling制御
         if (
           isInputConnected(this, "media_path") ||
           isInputConnected(this, "image") ||
@@ -701,7 +703,7 @@ app.registerExtension({
           if (!nextPath) {
             lastPolledPath = "";
             clear();
-        
+
             if (isInputConnected(this, "image")) {
               setStatus("Waiting image...");
             } else if (isInputConnected(this, "mask")) {
@@ -709,15 +711,15 @@ app.registerExtension({
             } else {
               setStatus("Waiting input...");
             }
-        
+
             this.setDirtyCanvas?.(true, true);
             return;
           }
-            
+
           lastPolledPath = nextPath;
           render(nextPath);
           this.setDirtyCanvas?.(true, true);
-            
+
         } finally {
           refreshBusy = false;
         }
@@ -877,7 +879,7 @@ app.registerExtension({
       const origOnRemoved = this.onRemoved;
       this.onRemoved = () => {
         try { origOnRemoved?.call(this); } catch (_) {}
-        stopPolling();  // ←追加
+        stopPolling();
         clear();
         try { wrap.remove(); } catch (_) {}
       };

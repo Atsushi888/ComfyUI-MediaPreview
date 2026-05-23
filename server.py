@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import os
-from aiohttp import web
+from aiohttp import web, ClientSession
 from server import PromptServer
+
+import traceback
+from aiohttp import web, ClientSession, ClientTimeout
 
 _VIDEO_EXTS = {".mp4", ".webm", ".mov", ".mkv", ".avi"}
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -29,6 +32,11 @@ def _realpath(p: str) -> str:
         return os.path.realpath(p).replace("\\", "/")
     except Exception:
         return _norm(p)
+
+
+def _is_url(path: str) -> bool:
+    s = (path or "").strip().lower()
+    return s.startswith("http://") or s.startswith("https://")
 
 
 def _is_allowed_dir(base_dir: str) -> bool:
@@ -93,23 +101,29 @@ def _node_id_from_unique_id(unique_id: str | None) -> str:
     return s
 
 
+def _resolve_local_file(path: str) -> str:
+    p = (path or "").strip()
+    if not p:
+        return ""
+    return _realpath(os.path.abspath(os.path.expanduser(p)))
+
+
 def set_preview_path(unique_id: str | None, path: str):
     if not unique_id:
         return
 
     uid = str(unique_id).strip()
-    norm_path = _norm(path or "")
+    raw_path = (path or "").strip()
     node_id = _node_id_from_unique_id(uid)
 
-    _PREVIEW_PATHS_BY_UID[uid] = norm_path
+    _PREVIEW_PATHS_BY_UID[uid] = raw_path
 
-    # 後方互換用
     if node_id:
-        _PREVIEW_PATHS_BY_NODE_ID[node_id] = norm_path
+        _PREVIEW_PATHS_BY_NODE_ID[node_id] = raw_path
 
     print(
         f"[MediaPreview] set_preview_path "
-        f"unique_id={uid!r} node_id={node_id!r} path={norm_path!r}"
+        f"unique_id={uid!r} node_id={node_id!r} path={raw_path!r}"
     )
 
 
@@ -175,6 +189,8 @@ def _extract_candidate_string_from_node(node: dict):
         sc = 0
         if "/" in s2 or "\\" in s2:
             sc += 3
+        if s2.startswith("http://") or s2.startswith("https://"):
+            sc += 4
         ext = os.path.splitext(s2)[1]
         if ext in _MEDIA_EXTS:
             sc += 5
@@ -236,6 +252,13 @@ def _resolve_upstream_string(graph: dict, target_node_id: int, input_name: str, 
 
 
 def _file_stat_payload(path: str) -> dict:
+    if _is_url(path):
+        return {
+            "file_exists": True,
+            "file_size": 0,
+            "file_mtime_ns": 0,
+        }
+
     try:
         st = os.stat(path)
         return {
@@ -250,6 +273,63 @@ def _file_stat_payload(path: str) -> dict:
             "file_mtime_ns": 0,
         }
 
+
+async def _proxy_remote_media(url: str):
+    print(f"[MediaPreview] proxy fetch start url={url!r}")
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+        "Referer": "https://civitai.red/",
+        "Origin": "https://civitai.red",
+    }
+
+    timeout = ClientTimeout(total=30)
+
+    try:
+        async with ClientSession(headers=headers, timeout=timeout) as session:
+            async with session.get(url, allow_redirects=True, ssl=False) as resp:
+                print(
+                    "[MediaPreview] proxy fetch response "
+                    f"status={resp.status} final_url={str(resp.url)!r} "
+                    f"content_type={resp.headers.get('Content-Type')!r}"
+                )
+
+                if resp.status != 200:
+                    text = await resp.text()
+                    print(f"[MediaPreview] proxy fetch non-200 body[:500]={text[:500]!r}")
+                    return web.Response(
+                        status=resp.status,
+                        text=f"Remote fetch failed: {resp.status}\n{text[:1000]}"
+                    )
+
+                content_type = resp.headers.get("Content-Type", "application/octet-stream")
+                body = await resp.read()
+                print(f"[MediaPreview] proxy fetch body_size={len(body)}")
+
+                if not body:
+                    return web.Response(status=502, text="Remote fetch returned empty body")
+
+                return web.Response(
+                    body=body,
+                    content_type=content_type,
+                    headers={
+                        "Cache-Control": "public, max-age=300",
+                    },
+                )
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[MediaPreview] proxy fetch exception: {e}")
+        print(tb)
+        return web.Response(
+            status=500,
+            text=f"Proxy exception: {type(e).__name__}: {e}\n\n{tb}"
+        )
 
 def register_routes():
     global _ROUTES_REGISTERED
@@ -278,14 +358,18 @@ def register_routes():
             if path:
                 source = "node_id"
 
-        stat_payload = _file_stat_payload(path) if path else {
+        stat_path = path
+        if stat_path and not _is_url(stat_path):
+            stat_path = _resolve_local_file(stat_path)
+
+        stat_payload = _file_stat_payload(stat_path) if stat_path else {
             "file_exists": False,
             "file_size": 0,
             "file_mtime_ns": 0,
         }
 
-        is_video = bool(path and os.path.splitext(path)[1].lower() in _VIDEO_EXTS)
-        is_image = bool(path and os.path.splitext(path)[1].lower() in _IMAGE_EXTS)
+        is_video = bool(stat_path and os.path.splitext(stat_path)[1].lower() in _VIDEO_EXTS)
+        is_image = bool(stat_path and os.path.splitext(stat_path)[1].lower() in _IMAGE_EXTS)
 
         print(
             f"[MediaPreview] /ping "
@@ -297,10 +381,11 @@ def register_routes():
             "ok": True,
             "unique_id": unique_id,
             "node_id": node_id,
-            "path": path if stat_payload["file_exists"] else "",
+            "path": stat_path if stat_payload["file_exists"] else "",
             "source": source,
             "is_video": is_video if stat_payload["file_exists"] else False,
             "is_image": is_image if stat_payload["file_exists"] else False,
+            "is_url": _is_url(stat_path) if stat_payload["file_exists"] else False,
             **stat_payload,
         })
 
@@ -308,11 +393,18 @@ def register_routes():
     async def media_preview_file(request):
         unique_id = (request.query.get("unique_id", "") or "").strip()
         node_id = (request.query.get("node_id", "") or "").strip()
+        direct_path = (request.query.get("path", "") or "").strip()
 
         path = ""
         source = ""
 
-        if unique_id:
+        # 1) 直指定 path を最優先
+        if direct_path:
+            path = direct_path
+            source = "direct_path"
+
+        # 2) 従来の unique_id / node_id 経由
+        if not path and unique_id:
             path = _find_path_by_unique_id(unique_id)
             if path:
                 source = "unique_id"
@@ -324,22 +416,33 @@ def register_routes():
 
         print(
             f"[MediaPreview] /file "
-            f"unique_id={unique_id!r} node_id={node_id!r} path={path!r} source={source!r}"
+            f"unique_id={unique_id!r} node_id={node_id!r} "
+            f"path={path!r} source={source!r}"
         )
 
         if not path:
             return web.Response(
                 status=404,
-                text=f"No preview path for unique_id={unique_id} node_id={node_id}"
+                text=f"No preview path for unique_id={unique_id} node_id={node_id} path={direct_path}"
             )
 
-        path = _norm(path)
+        path = (path or "").strip()
+
+        if _is_url(path):
+            if not _is_media_file(path):
+                return web.Response(status=415, text=f"Unsupported media URL: {path}")
+            return await _proxy_remote_media(path)
+
+        path = _resolve_local_file(path)
 
         if not _is_media_file(path):
             return web.Response(status=415, text=f"Unsupported media: {path}")
 
         if not os.path.isfile(path):
             return web.Response(status=404, text=f"File not found: {path}")
+
+        if not _is_allowed_dir(os.path.dirname(path)):
+            return web.Response(status=403, text=f"Access denied: {path}")
 
         return web.FileResponse(path)
 
